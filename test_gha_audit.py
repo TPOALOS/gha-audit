@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -15,8 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@%s
+        with:
+          persist-credentials: false
       - run: echo hello
 """ % SHA
+BARE = GOOD.replace("        with:\n          persist-credentials: false\n", "")
 
 
 def rules(text):
@@ -94,6 +100,108 @@ class CliTests(unittest.TestCase):
                 fh.write(GOOD + "      - uses: acme/tool@main\n")
             self.assertEqual(ga.main([wf]), 1)
             self.assertEqual(ga.main([os.path.join(d, "nope.yml")]), 2)
+
+
+def checkout_text(extra=""):
+    return BARE.replace("      - uses: actions/checkout@%s\n" % SHA, "      - uses: actions/checkout@%s\n%s" % (SHA, extra))
+
+
+class PersistCredentialsTests(unittest.TestCase):
+    def test_flagged_without_persist_false(self):
+        self.assertIn(("LOW", "checkout-persist-credentials"), rules(BARE))
+
+    def test_not_flagged_with_persist_false(self):
+        t = checkout_text("        with:\n          persist-credentials: false\n")
+        self.assertNotIn("checkout-persist-credentials", {r for _, r in rules(t)})
+
+    def test_persist_false_of_another_step_does_not_count(self):
+        t = (checkout_text() + "      - uses: actions/cache@%s\n        with:\n          persist-credentials: false\n" % SHA)
+        self.assertIn("checkout-persist-credentials", {r for _, r in rules(t)})
+
+    def test_checkout_not_first_key_in_step(self):
+        t = BARE.replace("      - uses: actions/checkout@%s\n" % SHA,
+                         "      - name: get code\n        uses: actions/checkout@%s\n        with:\n          persist-credentials: false\n" % SHA)
+        self.assertNotIn("checkout-persist-credentials", {r for _, r in rules(t)})
+
+
+class IgnoreTests(unittest.TestCase):
+    BAD = GOOD + "      - uses: acme/tool@main  # gha-audit: ignore\n"
+
+    def test_line_ignore_all(self):
+        self.assertNotIn("unpinned-action", {r for _, r in rules(self.BAD)})
+
+    def test_line_ignore_specific_rule(self):
+        t = GOOD + "      - uses: acme/tool@main  # gha-audit: ignore[unpinned-action]\n"
+        self.assertNotIn("unpinned-action", {r for _, r in rules(t)})
+
+    def test_line_ignore_other_rule_does_not_silence(self):
+        t = GOOD + "      - uses: acme/tool@main  # gha-audit: ignore[script-injection]\n"
+        self.assertIn("unpinned-action", {r for _, r in rules(t)})
+
+    def test_ignore_only_affects_its_own_line(self):
+        t = self.BAD + "      - uses: acme/other@main\n"
+        self.assertEqual(sum(1 for f in ga.audit_text(t) if f[1] == "unpinned-action"), 1)
+
+    def test_ignore_file(self):
+        t = "# gha-audit: ignore-file[missing-permissions,checkout-persist-credentials]\n" + BARE.replace(
+            "permissions:\n  contents: read\n", "")
+        self.assertEqual(rules(t), set())
+
+    def test_ignore_file_all(self):
+        self.assertEqual(rules("# gha-audit: ignore-file\n" + GOOD + "      - uses: acme/x@main\n"), set())
+
+
+def run_main(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = ga.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class FormatTests(unittest.TestCase):
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._t.name, "ci.yml")
+        with open(self.path, "w") as fh:
+            fh.write(GOOD + "      - uses: acme/tool@main\n")
+
+    def tearDown(self):
+        self._t.cleanup()
+
+    def test_json(self):
+        code, out, _ = run_main(self.path, "--format", "json")
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertIn("unpinned-action", {d["rule"] for d in data})
+        self.assertEqual({"severity", "rule", "file", "line", "message", "fix"}, set(data[0]))
+
+    def test_sarif_structure(self):
+        _, out, _ = run_main(self.path, "--format", "sarif")
+        sarif = json.loads(out)
+        self.assertEqual(sarif["version"], "2.1.0")
+        run = sarif["runs"][0]
+        self.assertEqual(run["tool"]["driver"]["name"], "gha-audit")
+        res = [r for r in run["results"] if r["ruleId"] == "unpinned-action"][0]
+        self.assertEqual(res["level"], "error")
+        self.assertGreaterEqual(res["locations"][0]["physicalLocation"]["region"]["startLine"], 1)
+        self.assertIn("unpinned-action", {r["id"] for r in run["tool"]["driver"]["rules"]})
+
+    def test_sarif_clean_is_valid_and_exit_zero(self):
+        with open(self.path, "w") as fh:
+            fh.write(GOOD)
+        code, out, _ = run_main(self.path, "--format", "sarif")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["runs"][0]["results"], [])
+
+    def test_text_unchanged(self):
+        code, out, err = run_main(self.path)
+        self.assertEqual(code, 1)
+        self.assertIn("fix:", out)
+        self.assertIn("finding(s)", err)
+
+    def test_min_severity_applies_to_json(self):
+        _, out, _ = run_main(self.path, "--format", "json", "--min-severity", "HIGH")
+        self.assertTrue(all(d["severity"] == "HIGH" for d in json.loads(out)))
 
 
 if __name__ == "__main__":

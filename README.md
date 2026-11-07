@@ -9,6 +9,9 @@ problem with a suggested fix. One file, standard library only.
 ```bash
 python3 gha_audit.py                       # defaults to .github/workflows
 python3 gha_audit.py path/to/ci.yml other-folder/ --min-severity MEDIUM
+python3 gha_audit.py --format json                 # machine-readable
+python3 gha_audit.py --format sarif > gha.sarif    # GitHub code scanning
+# or: pip install git+https://github.com/TPOALOS/gha-audit && gha-audit
 ```
 
 Example output:
@@ -35,8 +38,27 @@ MEDIUM missing-permissions  ci.yml: no `permissions:` block; the token may defau
 | `self-hosted-on-pr` | MEDIUM | self-hosted runners in workflows triggered by pull requests |
 | `unsecure-commands` | HIGH | `ACTIONS_ALLOW_UNSECURE_COMMANDS: true` |
 | `secret-in-command` | LOW | `${{ secrets.X }}` expanded inline in a shell command |
+| `checkout-persist-credentials` | LOW | `actions/checkout` without `persist-credentials: false`, which leaves the token in `.git/config` for later steps |
 
 Exit codes: `0` clean, `1` findings, `2` unreadable file or nothing to scan.
+
+### Silencing a finding you accept
+
+```yaml
+      - uses: acme/internal-tool@main   # gha-audit: ignore[unpinned-action]
+```
+
+`# gha-audit: ignore` silences every rule on that line, `# gha-audit: ignore-file[rule1,rule2]` silences rules
+for the whole file (use `ignore-file` without a list to silence everything).
+
+### Upload to GitHub code scanning
+
+```yaml
+      - run: python3 gha_audit.py --format sarif > gha.sarif || true
+      - uses: github/codeql-action/upload-sarif@<full-commit-sha>
+        with:
+          sarif_file: gha.sarif
+```
 
 ## Limits
 

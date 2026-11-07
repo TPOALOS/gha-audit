@@ -6,11 +6,12 @@ YAML parser), so it can miss things and can raise false positives; read
 the limits section of the README. Exit code 0 = clean, 1 = findings, 2 = error.
 """
 import argparse
+import json
 import os
 import re
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?([^'\"\s#]+)")
@@ -25,6 +26,9 @@ UNTRUSTED = re.compile(
     r"|commits[^}]*\.(?:message|author\.(?:email|name))|discussion\.(?:title|body))"
     r"|github\.head_ref)\s*\}\}")
 HEAD_REF = re.compile(r"github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref|github\.event\.workflow_run\.head_")
+PERSIST_FALSE = re.compile(r"^\s*persist-credentials:\s*['\"]?false\b", re.I)
+IGNORE_LINE = re.compile(r"#\s*gha-audit:\s*ignore(?!-file)(?:\[([^\]]*)\])?")
+IGNORE_FILE = re.compile(r"#\s*gha-audit:\s*ignore-file(?:\[([^\]]*)\])?")
 CURL_PIPE = re.compile(r"(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b")
 
 
@@ -55,7 +59,54 @@ def run_lines(lines):
         i += 1
 
 
+def step_block(code, i):
+    """Line indexes of the workflow step that contains line ``i``."""
+    indent = lambda l: len(l) - len(l.lstrip())
+    start = i
+    while start >= 0:
+        m = re.match(r"^(\s*)-\s", code[start])
+        if m and len(m.group(1)) <= indent(code[i]):
+            break
+        start -= 1
+    if start < 0:
+        return []
+    col = indent(code[start])
+    end = start + 1
+    while end < len(code):
+        if code[end].strip() and indent(code[end]) <= col:
+            break
+        end += 1
+    return list(range(start, end))
+
+
+def apply_ignores(lines, findings):
+    """Drop findings silenced by `# gha-audit: ignore[rule,...]` (line) or `ignore-file[...]` comments."""
+    file_rules, file_all = set(), False
+    for l in lines:
+        m = IGNORE_FILE.search(l)
+        if m:
+            if m.group(1):
+                file_rules.update(r.strip() for r in m.group(1).split(","))
+            else:
+                file_all = True
+    kept = []
+    for f in findings:
+        sev, rule, no = f[0], f[1], f[2]
+        if file_all or rule in file_rules:
+            continue
+        if no:
+            m = IGNORE_LINE.search(lines[no - 1])
+            if m and (not m.group(1) or rule in [r.strip() for r in m.group(1).split(",")]):
+                continue
+        kept.append(f)
+    return kept
+
+
 def audit_text(text):
+    return apply_ignores(text.splitlines(), _audit(text))
+
+
+def _audit(text):
     """Return list of (severity, rule, lineno, message, fix)."""
     lines = text.splitlines()
     code = [strip_comment(l) for l in lines]
@@ -86,6 +137,15 @@ def audit_text(text):
         else:
             add("MEDIUM", "unpinned-action", no, "third-party %s@%s is a movable tag" % (name, ref),
                 "pin to a full commit SHA and review the action")
+
+    for idx, line in enumerate(code):
+        m = USES.match(line)
+        if m and m.group(1).startswith("actions/checkout@"):
+            block = step_block(code, idx)
+            if block and not any(PERSIST_FALSE.match(code[j]) for j in block):
+                add("LOW", "checkout-persist-credentials", idx + 1,
+                    "checkout keeps the GITHUB_TOKEN in .git/config for every later step",
+                    "add `with: persist-credentials: false` unless a later step needs to push")
 
     if prt:
         for no, line in enumerate(code, 1):
@@ -142,9 +202,32 @@ def collect(paths):
             yield p
 
 
+def to_sarif(results):
+    level = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+    rules = sorted({r["rule"] for r in results})
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "gha-audit", "version": __version__,
+                                "informationUri": "https://github.com/TPOALOS/gha-audit",
+                                "rules": [{"id": r, "shortDescription": {"text": r}} for r in rules]}},
+            "results": [{
+                "ruleId": r["rule"], "level": level[r["severity"]],
+                "message": {"text": "%s. Fix: %s" % (r["message"], r["fix"])},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": r["file"].replace(os.sep, "/")},
+                    "region": {"startLine": r["line"] or 1}}}],
+            } for r in results],
+        }],
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Audit GitHub Actions workflows (offline).")
     ap.add_argument("paths", nargs="*", default=[".github/workflows"], help="workflow files or folders")
+    ap.add_argument("--format", choices=("text", "json", "sarif"), default="text",
+                    help="output format (sarif works with GitHub code scanning)")
     ap.add_argument("--min-severity", choices=("LOW", "MEDIUM", "HIGH"), default="LOW")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
@@ -152,7 +235,8 @@ def main(argv=None):
     if not files:
         print("gha-audit: no workflow files found", file=sys.stderr)
         return 2
-    limit, count = SEV[args.min_severity], 0
+    limit = SEV[args.min_severity]
+    results = []
     for path in files:
         try:
             with open(path, errors="replace") as fh:
@@ -161,10 +245,17 @@ def main(argv=None):
             print("gha-audit: %s" % exc, file=sys.stderr)
             return 2
         for sev, rule, no, msg, fix in sorted(findings, key=lambda f: (SEV[f[0]], f[2] or 0)):
-            if SEV[sev] > limit:
-                continue
-            count += 1
-            print("%-6s %-28s %s%s: %s\n         fix: %s" % (sev, rule, path, ":%d" % no if no else "", msg, fix))
+            if SEV[sev] <= limit:
+                results.append({"severity": sev, "rule": rule, "file": path, "line": no, "message": msg, "fix": fix})
+    count = len(results)
+    if args.format == "json":
+        print(json.dumps(results, indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(to_sarif(results), indent=2))
+    else:
+        for r in results:
+            where = "%s%s" % (r["file"], ":%d" % r["line"] if r["line"] else "")
+            print("%-6s %-28s %s: %s\n         fix: %s" % (r["severity"], r["rule"], where, r["message"], r["fix"]))
     print("gha-audit: %d finding(s) in %d file(s)" % (count, len(files)), file=sys.stderr)
     return 1 if count else 0
 
